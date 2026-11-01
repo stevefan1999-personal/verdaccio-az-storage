@@ -38,6 +38,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Fails on a high or critical advisory in the production dependencies that the lockfile resolves.
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
       - name: Lint
         run: pnpm lint
 
