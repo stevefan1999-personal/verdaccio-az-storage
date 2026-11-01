@@ -54,6 +54,10 @@ describe('the @verdaccio/e2e-cli battery against Verdaccio 7 with the plugin on 
             npm_config_cache: join(directory, 'npm-cache'),
             pnpm_config_store_dir: join(directory, 'pnpm-store'),
             pnpm_config_cache_dir: join(directory, 'pnpm-cache'),
+            // The scratch packages can sit inside someone's git work tree (a TMPDIR under a repository): pnpm then
+            // refuses to publish from the unclean tree, and `version` commits and tags in that repository. Git must
+            // not look above this suite's folder.
+            GIT_CEILING_DIRECTORIES: directory,
           }),
         },
       );
