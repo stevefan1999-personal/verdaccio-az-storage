@@ -1,11 +1,17 @@
 import { RestError } from '@azure/storage-blob';
 import { describe, expect, test } from 'vitest';
-import { AppConfigLocalStorageProvider, type LocalStorage } from '../src/localStorage';
+import { AppConfigLocalStorageProvider, KEY_VALUE_LIMIT_BYTES, type LocalStorage } from '../src/localStorage';
 import { MemoryAppConfiguration } from './fakes';
 
 const KEY = 'verdaccio-db';
 const SECRET = 'b'.repeat(32);
 const DOCUMENT: LocalStorage = { list: ['pkg'], secret: SECRET };
+
+// A database whose key-value (key, value and content type) is exactly `bytes` long.
+function databaseOfSize(bytes: number): LocalStorage {
+  const overhead = [KEY, JSON.stringify({ list: [''], secret: SECRET }), 'application/json'].join('').length;
+  return { list: ['p'.repeat(bytes - overhead)], secret: SECRET };
+}
 
 function providerWith(value?: string, keyName = KEY) {
   const store = new MemoryAppConfiguration();
@@ -89,6 +95,23 @@ describe('AppConfigLocalStorageProvider.write', () => {
       { onlyIfUnchanged: true },
     );
     await expect(provider.write(DOCUMENT, previous)).resolves.toBe('conflict');
+  });
+
+  test('writes a key-value of exactly 10 KB', async () => {
+    const { provider, store } = providerWith();
+    await expect(provider.write(databaseOfSize(KEY_VALUE_LIMIT_BYTES), { kind: 'missing' })).resolves.toBe('written');
+    expect(store.settings.get(KEY)?.value).toBe(JSON.stringify(databaseOfSize(KEY_VALUE_LIMIT_BYTES)));
+  });
+
+  test('refuses a key-value over 10 KB with its size, and sends nothing', async () => {
+    const { provider, store } = providerWith(JSON.stringify(DOCUMENT));
+    const previous = await provider.read();
+    await expect(provider.write(databaseOfSize(KEY_VALUE_LIMIT_BYTES + 1), previous)).rejects.toMatchObject({
+      code: 500,
+      message: `the verdaccio database needs ${KEY_VALUE_LIMIT_BYTES + 1} bytes, over the ${KEY_VALUE_LIMIT_BYTES} bytes of one App Configuration key-value`,
+    });
+    expect(store.setConfigurationSetting).not.toHaveBeenCalled();
+    expect(store.settings.get(KEY)?.value).toBe(JSON.stringify(DOCUMENT));
   });
 
   test('other failures reject', async () => {

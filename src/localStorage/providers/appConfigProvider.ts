@@ -11,6 +11,9 @@ import {
 
 type JsonSetting = { key: string; value: string; contentType: string };
 
+// App Configuration refuses a key-value over 10 KB, counting the key, the value and its attributes.
+export const KEY_VALUE_LIMIT_BYTES = 10 * 1024;
+
 /** The AppConfigurationClient calls this provider makes. The SDK client satisfies it, and the unit tests fake it. */
 export interface AppConfigurationStore {
   getConfigurationSetting(id: { key: string }): Promise<{ value?: string; etag?: string }>;
@@ -47,8 +50,15 @@ export class AppConfigLocalStorageProvider implements ILocalStorageProvider<Loca
     }
   }
 
-  write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome> {
+  async write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome> {
     const setting = { key: this.keyName, value: JSON.stringify(next), contentType: 'application/json' };
+    const size = Object.values(setting).reduce((total, text) => total + Buffer.byteLength(text), 0);
+    // Refused here with the size, because the refusal of the service reaches the client only as a status code.
+    if (size > KEY_VALUE_LIMIT_BYTES) {
+      throw errorUtils.getInternalError(
+        `the verdaccio database needs ${size} bytes, over the ${KEY_VALUE_LIMIT_BYTES} bytes of one App Configuration key-value`,
+      );
+    }
     // addConfigurationSetting sends If-None-Match: *, and onlyIfUnchanged sends If-Match with the read ETag.
     return writeOutcome(
       previous.kind === 'missing'
