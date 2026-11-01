@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-02
+
+### Changed
+
+- **Breaking:** the plugin implements the Verdaccio 7 promise storage API and requires Verdaccio 7 and Node.js 24 or later.
+- Token records are kept in their own blob, `.verdaccio-tokens.json`, for both database providers.
+- A missing package answers 404, and the cache header is `max-age`.
+
+### Fixed
+
+- A failed database read stops Verdaccio with an error instead of replacing the stored database with an empty one.
+- Package metadata updates use the blob ETag, so a concurrent writer gets a conflict instead of a lost update.
+- A `packagesDir` that leaves the container is refused, and an App Configuration database over 10 KB is refused before it is sent.
+
+### Added
+
+- Unit tests, the Verdaccio plugin verifier, and end-to-end tests with npm and pnpm against Verdaccio 7 and Azurite.
+
 ## [1.3.0] - 2025-07-15
 
 ### Changed
