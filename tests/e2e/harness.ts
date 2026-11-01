@@ -123,7 +123,10 @@ export class Azurite {
     this.connectionString = azuriteConnectionString(port);
   }
 
-  static async start({ port = 0, location }: { port?: number; location?: string } = {}): Promise<Azurite> {
+  static async start(
+    teardown: Teardown,
+    { port = 0, location }: { port?: number; location?: string } = {},
+  ): Promise<Azurite> {
     if (location !== undefined) {
       await mkdir(location, { recursive: true });
     }
@@ -137,6 +140,8 @@ export class Azurite {
       ],
       { env: isolatedEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] },
     );
+    // Registered before the wait, so an Azurite that never listens is stopped too.
+    teardown.add({ stop: () => stopProcess(child) });
     const output = collect(child.stdout);
     const listeningPort = await new Promise<number>((resolve, reject) => {
       child.once('error', reject);
@@ -244,6 +249,7 @@ export class Verdaccio {
   }
 
   static async launch(
+    teardown: Teardown,
     directory: string,
     store: AzureStore,
     { port, uplinkPort }: LaunchOptions,
@@ -255,6 +261,8 @@ export class Verdaccio {
       env: isolatedEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
+    // Registered before the wait, so a Verdaccio that neither listens nor exits is stopped too.
+    teardown.add({ stop: () => stopProcess(child) });
     const stdout = collect(child.stdout);
     const stderr = collect(child.stderr);
     const output = () => stdout() + stderr();
@@ -270,8 +278,13 @@ export class Verdaccio {
     });
   }
 
-  static async start(directory: string, store: AzureStore, options: LaunchOptions): Promise<Verdaccio> {
-    const launch = await Verdaccio.launch(directory, store, options);
+  static async start(
+    teardown: Teardown,
+    directory: string,
+    store: AzureStore,
+    options: LaunchOptions,
+  ): Promise<Verdaccio> {
+    const launch = await Verdaccio.launch(teardown, directory, store, options);
     if (launch.kind === 'exited') {
       throw new Error(`verdaccio exited with code ${launch.exitCode} before it listened\n${launch.log}`);
     }

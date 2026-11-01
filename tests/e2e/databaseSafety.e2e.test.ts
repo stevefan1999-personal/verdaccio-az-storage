@@ -41,11 +41,16 @@ let npm: Npm;
 let apiToken: string;
 let storedDocuments: StoredBlob[];
 
-const startVerdaccio = async () => teardown.add(await Verdaccio.start(join(directory, CONTAINER), store, { port }));
+const startVerdaccio = () => Verdaccio.start(teardown, join(directory, CONTAINER), store, { port });
 
 // These starts must fail. One that does not is stopped at once, so it cannot hold the port for the next test.
 async function failedStart(containerName: string, connectionString = store.connectionString) {
-  const launch = await Verdaccio.launch(join(directory, containerName), { connectionString, containerName }, { port });
+  const launch = await Verdaccio.launch(
+    teardown,
+    join(directory, containerName),
+    { connectionString, containerName },
+    { port },
+  );
   if (launch.kind === 'exited') {
     return launch;
   }
@@ -58,7 +63,7 @@ describe('Verdaccio start-up when the database cannot be read', () => {
   beforeAll(async () => {
     directory = await teardown.temporaryDirectory('safety');
     location = join(directory, 'azurite');
-    azurite = teardown.add(await Azurite.start({ location }));
+    azurite = await Azurite.start(teardown, { location });
     container = azurite.container(CONTAINER);
     await container.create();
     store = { connectionString: azurite.connectionString, containerName: CONTAINER };
@@ -117,7 +122,7 @@ describe('Verdaccio start-up when the database cannot be read', () => {
       log: expect.stringContaining('azure request failed: no response ECONNREFUSED'),
     });
 
-    azurite = teardown.add(await Azurite.start({ location, port: azurite.port }));
+    azurite = await Azurite.start(teardown, { location, port: azurite.port });
     // The same bytes and ETags: nothing was written while the reads failed.
     expect(await readStoredDocuments(container)).toEqual(storedDocuments);
     expect((await readDatabase(container)).database.list).toEqual([PACKAGE]);

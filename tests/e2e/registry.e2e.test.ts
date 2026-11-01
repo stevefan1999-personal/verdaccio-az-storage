@@ -67,12 +67,12 @@ async function expectServedTarballsMatchIntegrity(name: string, versions: readon
 describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
   beforeAll(async () => {
     directory = await teardown.temporaryDirectory('registry');
-    const azurite = teardown.add(await Azurite.start());
+    const azurite = await Azurite.start(teardown);
     container = azurite.container(CONTAINER);
     await container.create();
     store = { connectionString: azurite.connectionString, containerName: CONTAINER };
     port = await freePort();
-    verdaccio = teardown.add(await Verdaccio.start(join(directory, 'verdaccio'), store, { port }));
+    verdaccio = await Verdaccio.start(teardown, join(directory, 'verdaccio'), store, { port });
     const sessionToken = await addUser(verdaccio.url, USER, PASSWORD);
     // npm token create reads the password from its configuration instead of a prompt.
     npm = await Npm.create(join(directory, 'publisher'), verdaccio.url, sessionToken, {
@@ -143,7 +143,7 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
     const before = await readStoredDocuments(container);
     expect(verdaccio.log()).not.toContain(LEGACY_ADAPTER_WARNING);
     await verdaccio.stop();
-    verdaccio = teardown.add(await Verdaccio.start(join(directory, 'verdaccio'), store, { port }));
+    verdaccio = await Verdaccio.start(teardown, join(directory, 'verdaccio'), store, { port });
     expect(await readStoredDocuments(container)).toEqual(before);
     // The token decrypts only with the stored secret, and Verdaccio also looks its key up in the stored tokens.
     expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);

@@ -24,13 +24,14 @@ let verdaccio: Verdaccio;
 describe('the @verdaccio/e2e-cli battery against Verdaccio 7 with the plugin on Azurite', () => {
   beforeAll(async () => {
     directory = await teardown.temporaryDirectory('battery');
-    const azurite = teardown.add(await Azurite.start());
+    const azurite = await Azurite.start(teardown);
     await azurite.container(CONTAINER).create();
     const store = { connectionString: azurite.connectionString, containerName: CONTAINER };
     uplinkPort = await freePort();
-    verdaccio = teardown.add(
-      await Verdaccio.start(join(directory, 'verdaccio'), store, { port: await freePort(), uplinkPort }),
-    );
+    verdaccio = await Verdaccio.start(teardown, join(directory, 'verdaccio'), store, {
+      port: await freePort(),
+      uplinkPort,
+    });
   });
 
   afterAll(() => teardown.run());
