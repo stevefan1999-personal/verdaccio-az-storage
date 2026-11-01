@@ -2,6 +2,7 @@ import { type ChildProcess, fork, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { type AddressInfo, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -101,7 +102,7 @@ export async function freePort(): Promise<number> {
   return port;
 }
 
-const azuriteConnectionString = (port: number): string =>
+export const azuriteConnectionString = (port: number): string =>
   [
     'DefaultEndpointsProtocol=http',
     `AccountName=${AZURITE_ACCOUNT_NAME}`,
@@ -109,7 +110,7 @@ const azuriteConnectionString = (port: number): string =>
     `BlobEndpoint=http://127.0.0.1:${port}/${AZURITE_ACCOUNT_NAME}`,
   ].join(';');
 
-/** An Azurite blob service that keeps its data in memory. */
+/** An Azurite blob service in memory, or in `location` so that a restart on the same port keeps the data. */
 export class Azurite {
   readonly port: number;
   readonly connectionString: string;
@@ -121,12 +122,16 @@ export class Azurite {
     this.connectionString = azuriteConnectionString(port);
   }
 
-  static async start(): Promise<Azurite> {
+  static async start({ port = 0, location }: { port?: number; location?: string } = {}): Promise<Azurite> {
+    if (location !== undefined) {
+      await mkdir(location, { recursive: true });
+    }
+    const persistence = location === undefined ? ['--inMemoryPersistence'] : ['--location', location];
     const child = spawn(
       process.execPath,
       [
         AZURITE_BLOB,
-        ...['--blobHost', '127.0.0.1', '--blobPort', '0', '--inMemoryPersistence'],
+        ...['--blobHost', '127.0.0.1', '--blobPort', String(port), ...persistence],
         ...['--disableTelemetry', '--skipApiVersionCheck', '--loose', '--silent'],
       ],
       { env: isolatedEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] },
@@ -152,6 +157,50 @@ export class Azurite {
   stop(): Promise<void> {
     return stopProcess(this.child);
   }
+}
+
+const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
+const DENIED_READ = '<?xml version="1.0" encoding="utf-8"?><Error><Code>AuthorizationPermissionMismatch</Code></Error>';
+
+/**
+ * Forwards to Azurite but answers 403 to every read of one blob, as a role that may write but not read would.
+ * Writes still reach Azurite, so a plugin that took the failed read for "missing" would replace the blob.
+ */
+export async function startReadDenyingProxy(
+  targetPort: number,
+  deniedBlobName: string,
+): Promise<{ port: number; stop: () => Promise<void> }> {
+  const server = createHttpServer((request, response) => {
+    if (READ_METHODS.has(request.method ?? '') && request.url?.split('?')[0]?.endsWith(`/${deniedBlobName}`)) {
+      response.writeHead(403, {
+        'content-type': 'application/xml',
+        'x-ms-error-code': 'AuthorizationPermissionMismatch',
+      });
+      response.end(DENIED_READ);
+      return;
+    }
+    const { method, url: path, headers } = request;
+    const forwarded = httpRequest({ host: '127.0.0.1', port: targetPort, method, path, headers }, (answer) => {
+      response.writeHead(answer.statusCode ?? 502, answer.headers);
+      answer.pipe(response);
+    });
+    forwarded.on('error', (error) => response.destroy(error));
+    request.pipe(forwarded);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const { port } = server.address() as AddressInfo;
+  return {
+    port,
+    stop: async () => {
+      if (!server.listening) {
+        return;
+      }
+      server.closeAllConnections();
+      server.close();
+      await once(server, 'close');
+    },
+  };
 }
 
 export type AzureStore = { connectionString: string; containerName: string };
