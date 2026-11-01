@@ -5,7 +5,7 @@ import { MemoryAppConfiguration } from './fakes';
 
 const KEY = 'verdaccio-db';
 const SECRET = 'b'.repeat(32);
-const DOCUMENT: LocalStorage = { list: ['pkg'], secret: SECRET, tokens: [] };
+const DOCUMENT: LocalStorage = { list: ['pkg'], secret: SECRET };
 
 function providerWith(value?: string, keyName = KEY) {
   const store = new MemoryAppConfiguration();

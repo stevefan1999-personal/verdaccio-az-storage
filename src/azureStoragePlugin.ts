@@ -8,19 +8,31 @@ import { LOGGER_PREFIX } from './constants';
 import {
   AppConfigLocalStorageProvider,
   type ILocalStorageProvider,
+  type LocalStorage,
   LocalStorageDatabase,
+  parseLocalStorage,
+  parseTokenDocument,
   StorageBlobLocalStorageProvider,
+  type TokenDocument,
   TokenSchema,
 } from './localStorage';
 import { PackageUpdates } from './packageUpdates';
 import type { PluginContainer } from './storedDocument';
 
 const DATABASE_BLOB_NAME = '.verdaccio-db.json';
+// Tokens have their own blob, also when the database is in App Configuration: one key-value holds at most
+// 10 KB, and Verdaccio reads the tokens on every request that carries a generated token.
+const TOKENS_BLOB_NAME = '.verdaccio-tokens.json';
+const EMPTY_DATABASE: LocalStorage = { list: [], secret: '' };
+const EMPTY_TOKENS: TokenDocument = { tokens: [] };
 const SEARCH_SCORE: searchUtils.Score = { final: 1, detail: { quality: 1, popularity: 1, maintenance: 0 } };
 
-function createDatabaseProvider(config: AzureStorageConfig, container: PluginContainer): ILocalStorageProvider {
+function createDatabaseProvider(
+  config: AzureStorageConfig,
+  container: PluginContainer,
+): ILocalStorageProvider<LocalStorage> {
   return config.appConfigConnectionString === undefined
-    ? new StorageBlobLocalStorageProvider(container.getBlockBlobClient(DATABASE_BLOB_NAME))
+    ? new StorageBlobLocalStorageProvider(container.getBlockBlobClient(DATABASE_BLOB_NAME), parseLocalStorage)
     : new AppConfigLocalStorageProvider(
         createAppConfigurationStore(config.appConfigConnectionString),
         config.appConfigKeyName,
@@ -41,7 +53,8 @@ export class AzureStoragePlugin
   readonly logger: Logger;
   private readonly settings: AzureStorageConfig;
   private readonly container: PluginContainer;
-  private readonly database: LocalStorageDatabase;
+  private readonly database: LocalStorageDatabase<LocalStorage>;
+  private readonly tokens: LocalStorageDatabase<TokenDocument>;
   // Shared by every handler, because the store saves a manifest through a new handler.
   private readonly packageUpdates = new PackageUpdates();
 
@@ -52,19 +65,24 @@ export class AzureStoragePlugin
     this.settings = settings;
     this.logger = options.logger;
     this.container = createContainerClient(settings);
-    this.database = new LocalStorageDatabase(createDatabaseProvider(settings, this.container));
+    this.database = new LocalStorageDatabase(createDatabaseProvider(settings, this.container), EMPTY_DATABASE);
+    this.tokens = new LocalStorageDatabase(
+      new StorageBlobLocalStorageProvider(this.container.getBlockBlobClient(TOKENS_BLOB_NAME), parseTokenDocument),
+      EMPTY_TOKENS,
+    );
     this.logger.info(
       {
         containerName: settings.containerName,
         database: settings.appConfigConnectionString === undefined ? DATABASE_BLOB_NAME : 'App Configuration',
+        tokens: TOKENS_BLOB_NAME,
       },
-      `${LOGGER_PREFIX}: container @{containerName}, verdaccio database in @{database}`,
+      `${LOGGER_PREFIX}: container @{containerName}, verdaccio database in @{database}, tokens in @{tokens}`,
     );
   }
 
-  /** Reads the database once, so a database that cannot be read stops Verdaccio before it serves. */
+  /** Reads both documents once, so a document that cannot be read stops Verdaccio before it serves. */
   async init(): Promise<void> {
-    await this.database.read();
+    await Promise.all([this.database.read(), this.tokens.read()]);
   }
 
   async getSecret(): Promise<string> {
@@ -117,27 +135,27 @@ export class AzureStoragePlugin
     return new AzureStoragePackageManager(packageName, this.settings, this.logger, this.container, this.packageUpdates);
   }
 
-  /** Upserts by user and key. Tokens live next to the secret, which encrypts the two-factor records. */
+  /** Upserts by user and key. */
   async saveToken(token: Token): Promise<void> {
-    // Validated before it is stored: a record the read schema rejects would make the database unreadable.
+    // Validated before it is stored: a record the read schema rejects would make every token lookup fail.
     const parsed = TokenSchema.safeParse(token);
     if (!parsed.success) {
       throw errorUtils.getBadData(`the token cannot be stored\n${z.prettifyError(parsed.error)}`);
     }
-    await this.database.update((current) => ({
+    await this.tokens.update((current) => ({
       ...current,
       tokens: [...current.tokens.filter((existing) => !isSameToken(existing, token.user, token.key)), parsed.data],
     }));
   }
 
   deleteToken(user: string, tokenKey: string): Promise<void> {
-    return this.database.update((current) => ({
+    return this.tokens.update((current) => ({
       ...current,
       tokens: current.tokens.filter((existing) => !isSameToken(existing, user, tokenKey)),
     }));
   }
 
   async readTokens({ user }: TokenFilter): Promise<Token[]> {
-    return (await this.database.read()).tokens.filter((token) => token.user === user);
+    return (await this.tokens.read()).tokens.filter((token) => token.user === user);
   }
 }

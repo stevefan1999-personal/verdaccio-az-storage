@@ -15,27 +15,33 @@ export const TokenSchema = z.looseObject({
   updated: timestamp.optional(),
 });
 
-// Loose, so that keys this version does not know survive a rewrite. 1.x documents have no tokens.
-// Compiled, because every token-authenticated request reads the database.
-export const LocalStorageSchema = z.compile(
-  z.looseObject({ list: z.array(z.string()), secret: z.string(), tokens: z.array(TokenSchema).default([]) }),
-  { strict: true },
-);
+// Loose, so that keys this version does not know survive a rewrite; the database keeps the 1.x shape.
+// Compiled, because every call parses its document again, and Verdaccio reads the tokens on every
+// request that carries a generated token.
+export const LocalStorageSchema = z.compile(z.looseObject({ list: z.array(z.string()), secret: z.string() }), {
+  strict: true,
+});
+export const TokenDocumentSchema = z.compile(z.looseObject({ tokens: z.array(TokenSchema) }), { strict: true });
 
 export type LocalStorage = z.infer<typeof LocalStorageSchema>;
+export type TokenDocument = z.infer<typeof TokenDocumentSchema>;
 export type StoredLocalStorage = StoredDocument<LocalStorage>;
 export type WriteOutcome = 'written' | 'conflict';
 
-/** Where the Verdaccio database document lives. */
-export interface ILocalStorageProvider {
+/** Where one document of the Verdaccio database lives. */
+export interface ILocalStorageProvider<Document> {
   /** Missing only when the backend answered "not found"; every other failure rejects. */
-  read(): Promise<StoredLocalStorage>;
+  read(): Promise<StoredDocument<Document>>;
   /** Create-only when `previous` was missing, If-Match on its ETag otherwise; a lost race is a conflict. */
-  write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome>;
+  write(next: Document, previous: StoredDocument<Document>): Promise<WriteOutcome>;
 }
 
 export function parseLocalStorage(text: string): LocalStorage {
   return parseJsonDocument(text, LocalStorageSchema, 'the verdaccio database');
+}
+
+export function parseTokenDocument(text: string): TokenDocument {
+  return parseJsonDocument(text, TokenDocumentSchema, 'the verdaccio tokens');
 }
 
 export function writeOutcome(write: Promise<unknown>): Promise<WriteOutcome> {

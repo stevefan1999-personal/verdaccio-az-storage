@@ -1,17 +1,23 @@
 import { RestError } from '@azure/storage-blob';
 import { describe, expect, test } from 'vitest';
-import { type LocalStorage, StorageBlobLocalStorageProvider } from '../src/localStorage';
+import {
+  type LocalStorage,
+  parseLocalStorage,
+  parseTokenDocument,
+  StorageBlobLocalStorageProvider,
+} from '../src/localStorage';
 import { azureError, MemoryContainer } from './fakes';
 
 const DATABASE = '.verdaccio-db.json';
+const TOKENS = '.verdaccio-tokens.json';
 const SECRET = 'a'.repeat(32);
-const DOCUMENT: LocalStorage = { list: ['pkg'], secret: SECRET, tokens: [] };
+const DOCUMENT: LocalStorage = { list: ['pkg'], secret: SECRET };
 
 function providerWith(content?: string) {
   const container = new MemoryContainer();
   const etag = content === undefined ? undefined : container.seed(DATABASE, content);
   const blob = container.getBlockBlobClient(DATABASE);
-  return { container, blob, etag, provider: new StorageBlobLocalStorageProvider(blob) };
+  return { container, blob, etag, provider: new StorageBlobLocalStorageProvider(blob, parseLocalStorage) };
 }
 
 describe('StorageBlobLocalStorageProvider.read', () => {
@@ -24,9 +30,12 @@ describe('StorageBlobLocalStorageProvider.read', () => {
     });
   });
 
-  test('reads a 1.x document, which has no tokens, with an empty token list', async () => {
-    const { provider } = providerWith(JSON.stringify({ list: ['old'], secret: SECRET }));
-    await expect(provider.read()).resolves.toMatchObject({ document: { list: ['old'], secret: SECRET, tokens: [] } });
+  test('reads the token document with the parser it was given', async () => {
+    const container = new MemoryContainer();
+    const document = { tokens: [{ user: 'alice', token: 'masked', key: 'key-1', readonly: false, created: 1 }] };
+    const etag = container.seed(TOKENS, JSON.stringify(document));
+    const provider = new StorageBlobLocalStorageProvider(container.getBlockBlobClient(TOKENS), parseTokenDocument);
+    await expect(provider.read()).resolves.toEqual({ kind: 'present', document, etag });
   });
 
   test('a definite BlobNotFound reads as missing', async () => {
@@ -73,7 +82,7 @@ describe('StorageBlobLocalStorageProvider.write', () => {
 
   test('a create that finds a document is a conflict and leaves that document alone', async () => {
     const { provider, container } = providerWith(JSON.stringify(DOCUMENT));
-    await expect(provider.write({ list: [], secret: '', tokens: [] }, { kind: 'missing' })).resolves.toBe('conflict');
+    await expect(provider.write({ list: [], secret: '' }, { kind: 'missing' })).resolves.toBe('conflict');
     expect(JSON.parse(container.textOf(DATABASE) ?? '')).toEqual(DOCUMENT);
   });
 

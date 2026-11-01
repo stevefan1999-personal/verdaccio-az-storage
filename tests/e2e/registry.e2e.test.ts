@@ -9,14 +9,14 @@ import {
   addUser,
   blobNames,
   CreatedToken,
-  DATABASE_BLOB,
   freePort,
   LEGACY_ADAPTER_WARNING,
   ListedTokens,
   Npm,
   packageSource,
-  readBlob,
   readDatabase,
+  readStoredDocuments,
+  readTokens,
   servedIntegrity,
   Teardown,
   Verdaccio,
@@ -133,18 +133,18 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
     tokenUser = await Npm.create(join(directory, 'token-user'), verdaccio.url, apiToken);
     const listed = await npm.json(['token', 'list'], ListedTokens);
     expect(listed).toHaveLength(1);
-    const { text, database } = await readDatabase(container);
-    expect(database.tokens).toEqual([expect.objectContaining({ user: USER, key: listed[0]?.key })]);
+    const { text, tokens } = await readTokens(container);
+    expect(tokens).toEqual([expect.objectContaining({ user: USER, key: listed[0]?.key })]);
     expect(text).not.toContain(apiToken);
     expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);
   });
 
   test('keeps the packages, the secret and the token after a restart, without rewriting the database', async () => {
-    const before = await readBlob(container, DATABASE_BLOB);
+    const before = await readStoredDocuments(container);
     expect(verdaccio.log()).not.toContain(LEGACY_ADAPTER_WARNING);
     await verdaccio.stop();
     verdaccio = teardown.add(await Verdaccio.start(join(directory, 'verdaccio'), store, { port }));
-    expect(await readBlob(container, DATABASE_BLOB)).toEqual(before);
+    expect(await readStoredDocuments(container)).toEqual(before);
     // The token decrypts only with the stored secret, and Verdaccio also looks its key up in the stored tokens.
     expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);
     expect(await npm.json(['token', 'list'], ListedTokens)).toHaveLength(1);
@@ -159,7 +159,7 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
     const [listed] = await npm.json(['token', 'list'], ListedTokens);
     await npm.exec(['token', 'revoke', z.string().parse(listed?.key)]);
     expect(await npm.json(['token', 'list'], ListedTokens)).toEqual([]);
-    expect((await readDatabase(container)).database.tokens).toEqual([]);
+    expect((await readTokens(container)).tokens).toEqual([]);
     expect(await tokenUser.run(['whoami'])).toMatchObject({ exitCode: 1, stderr: expect.stringContaining('E403') });
   });
 

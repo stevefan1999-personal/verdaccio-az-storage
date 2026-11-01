@@ -18,6 +18,7 @@ const AZURITE_BLOB = join(NODE_MODULES, 'azurite', 'dist', 'src', 'blob', 'main.
 const VERDACCIO = join(NODE_MODULES, 'verdaccio', 'bin', 'verdaccio');
 export const E2E_CLI = join(NODE_MODULES, '@verdaccio', 'e2e-cli', 'bin', 'e2e-cli.js');
 export const DATABASE_BLOB = '.verdaccio-db.json';
+export const TOKENS_BLOB = '.verdaccio-tokens.json';
 export const LEGACY_ADAPTER_WARNING = 'legacy callback-based storage plugin';
 
 // The caller's AZ_STORAGE_* would point the plugin at a real account, and pnpm exports npm_config_* that
@@ -382,9 +383,8 @@ export async function blobNames(container: ContainerClient, prefix: string): Pro
   return (await Array.fromAsync(container.listBlobsFlat({ prefix }))).map(({ name }) => name);
 }
 
-const StoredDatabase = z.object({
-  list: z.array(z.string()),
-  secret: z.string(),
+const StoredDatabase = z.object({ list: z.array(z.string()), secret: z.string() });
+const StoredTokens = z.object({
   tokens: z.array(z.object({ user: z.string(), key: z.string(), token: z.string() })),
 });
 
@@ -392,3 +392,12 @@ export async function readDatabase(container: ContainerClient) {
   const stored = await readBlob(container, DATABASE_BLOB);
   return { ...stored, database: StoredDatabase.parse(JSON.parse(stored.text)) };
 }
+
+export async function readTokens(container: ContainerClient) {
+  const stored = await readBlob(container, TOKENS_BLOB);
+  return { ...stored, tokens: StoredTokens.parse(JSON.parse(stored.text)).tokens };
+}
+
+/** The bytes and ETags of both database blobs, to show that nothing rewrote them. */
+export const readStoredDocuments = (container: ContainerClient): Promise<StoredBlob[]> =>
+  Promise.all([readBlob(container, DATABASE_BLOB), readBlob(container, TOKENS_BLOB)]);

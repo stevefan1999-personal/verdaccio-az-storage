@@ -1,26 +1,21 @@
-import { type PluginBlob, readBlobDocument } from '../../storedDocument';
-import {
-  type ILocalStorageProvider,
-  type LocalStorage,
-  parseLocalStorage,
-  type StoredLocalStorage,
-  type WriteOutcome,
-  writeOutcome,
-} from '../localStorageProvider';
+import { type PluginBlob, readBlobDocument, type StoredDocument } from '../../storedDocument';
+import { type ILocalStorageProvider, type WriteOutcome, writeOutcome } from '../localStorageProvider';
 
-/** Keeps the database in `.verdaccio-db.json` at the container root. */
-export class StorageBlobLocalStorageProvider implements ILocalStorageProvider {
+/** Keeps one database document in a JSON blob at the container root. */
+export class StorageBlobLocalStorageProvider<Document> implements ILocalStorageProvider<Document> {
   private readonly blob: PluginBlob;
+  private readonly parse: (text: string) => Document;
 
-  constructor(blob: PluginBlob) {
+  constructor(blob: PluginBlob, parse: (text: string) => Document) {
     this.blob = blob;
+    this.parse = parse;
   }
 
-  read(): Promise<StoredLocalStorage> {
-    return readBlobDocument(this.blob, parseLocalStorage);
+  read(): Promise<StoredDocument<Document>> {
+    return readBlobDocument(this.blob, this.parse);
   }
 
-  write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome> {
+  write(next: Document, previous: StoredDocument<Document>): Promise<WriteOutcome> {
     // One Put Blob: a reader sees the old document or the new one, never a mix.
     return writeOutcome(
       this.blob.uploadData(Buffer.from(JSON.stringify(next)), {

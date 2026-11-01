@@ -22,7 +22,7 @@ export interface AppConfigurationStore {
 }
 
 /** Keeps the database in one Azure App Configuration key-value. */
-export class AppConfigLocalStorageProvider implements ILocalStorageProvider {
+export class AppConfigLocalStorageProvider implements ILocalStorageProvider<LocalStorage> {
   private readonly client: AppConfigurationStore;
   private readonly keyName: string;
 

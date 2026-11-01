@@ -16,6 +16,7 @@ import {
 vi.mock('../src/azureAuth', () => ({ createContainerClient: vi.fn(), createAppConfigurationStore: vi.fn() }));
 
 const DATABASE = '.verdaccio-db.json';
+const TOKENS = '.verdaccio-tokens.json';
 const SECRET = 'c'.repeat(32);
 const SECTION = { connectionString: AZURITE_CONNECTION_STRING, containerName: 'verdaccio' };
 const APP_CONFIG_CONNECTION_STRING = 'Endpoint=https://store.azconfig.io;Id=id;Secret=c2VjcmV0';
@@ -25,10 +26,19 @@ function setup(section: Record<string, unknown> = SECTION, container = new Memor
   vi.mocked(createContainerClient).mockReturnValue(container);
   vi.mocked(createAppConfigurationStore).mockReturnValue(appConfiguration);
   const plugin = new AzureStoragePlugin(section, { config: fakeVerdaccioConfig(), logger: fakeLogger() });
-  return { plugin, container, appConfiguration, databaseBlob: container.getBlockBlobClient(DATABASE) };
+  return {
+    plugin,
+    container,
+    appConfiguration,
+    databaseBlob: container.getBlockBlobClient(DATABASE),
+    tokensBlob: container.getBlockBlobClient(TOKENS),
+  };
 }
 
-const storedDatabase = (container: MemoryContainer): unknown => JSON.parse(container.textOf(DATABASE) ?? 'null');
+const storedJson = (container: MemoryContainer, blobName: string): unknown =>
+  JSON.parse(container.textOf(blobName) ?? 'null');
+const storedDatabase = (container: MemoryContainer): unknown => storedJson(container, DATABASE);
+const storedTokens = (container: MemoryContainer): unknown => storedJson(container, TOKENS);
 
 function tokenOf(user: string, key: string, extra: Partial<Token> = {}): Token {
   return { user, key, token: 'masked', readonly: false, created: 1_700_000_000_000, ...extra };
@@ -72,7 +82,7 @@ describe('database location', () => {
   test('without appConfigConnectionString the database is the blob at the container root', async () => {
     const { plugin, container } = setup();
     await plugin.add('pkg');
-    expect(storedDatabase(container)).toEqual({ list: ['pkg'], secret: '', tokens: [] });
+    expect(storedDatabase(container)).toEqual({ list: ['pkg'], secret: '' });
   });
 
   test('with appConfigConnectionString the database is the configured App Configuration key', async () => {
@@ -85,6 +95,32 @@ describe('database location', () => {
     expect(createAppConfigurationStore).toHaveBeenCalledWith(APP_CONFIG_CONNECTION_STRING);
     expect(JSON.parse(appConfiguration.settings.get('custom-key')?.value ?? 'null')).toMatchObject({ list: ['pkg'] });
     expect(container.blobs.size).toBe(0);
+  });
+
+  // One key-value holds at most 10 KB, and two-factor records are about 2.4 KB each.
+  test('token records have their own blob, so the App Configuration key-value keeps only the list and the secret', async () => {
+    const { plugin, container, appConfiguration } = setup({
+      ...SECTION,
+      appConfigConnectionString: APP_CONFIG_CONNECTION_STRING,
+    });
+    await plugin.add('pkg');
+    await plugin.saveToken(tokenOf('alice', 'key-1'));
+    expect(JSON.parse(appConfiguration.settings.get('verdaccio-db')?.value ?? 'null')).toEqual({
+      list: ['pkg'],
+      secret: '',
+    });
+    expect(storedTokens(container)).toEqual({ tokens: [tokenOf('alice', 'key-1')] });
+  });
+
+  // Verdaccio reads the tokens on every request with a generated token; the Free tier allows 1,000 requests a day.
+  test('token calls never reach App Configuration', async () => {
+    const { plugin, appConfiguration } = setup({ ...SECTION, appConfigConnectionString: APP_CONFIG_CONNECTION_STRING });
+    await plugin.saveToken(tokenOf('alice', 'key-1'));
+    await plugin.readTokens({ user: 'alice' });
+    await plugin.deleteToken('alice', 'key-1');
+    expect(appConfiguration.getConfigurationSetting).not.toHaveBeenCalled();
+    expect(appConfiguration.addConfigurationSetting).not.toHaveBeenCalled();
+    expect(appConfiguration.setConfigurationSetting).not.toHaveBeenCalled();
   });
 });
 
@@ -104,6 +140,13 @@ describe('init', () => {
     databaseBlob.download.mockRejectedValueOnce(error);
     await expect(plugin.init()).rejects.toMatchObject({ code: expect.any(Number) });
     expect(databaseBlob.uploadData).not.toHaveBeenCalled();
+  });
+
+  test('rejects when the tokens cannot be read, and writes nothing', async () => {
+    const { plugin, tokensBlob } = setup();
+    tokensBlob.download.mockRejectedValueOnce(azureError(403, 'AuthorizationFailure'));
+    await expect(plugin.init()).rejects.toMatchObject({ code: 500 });
+    expect(tokensBlob.uploadData).not.toHaveBeenCalled();
   });
 
   test('rejects for a database that is not valid JSON, and leaves it as it is', async () => {
@@ -132,7 +175,7 @@ describe('secret', () => {
     const { plugin, container } = setup();
     container.seed(DATABASE, JSON.stringify({ list: ['pkg'], secret: '' }));
     await plugin.setSecret(SECRET);
-    expect(storedDatabase(container)).toEqual({ list: ['pkg'], secret: SECRET, tokens: [] });
+    expect(storedDatabase(container)).toEqual({ list: ['pkg'], secret: SECRET });
   });
 
   test('setSecret with the stored secret does not write', async () => {
@@ -229,7 +272,7 @@ describe('tokens', () => {
     await expect(plugin.readTokens({ user: 'alice' })).resolves.toEqual([
       tokenOf('alice', 'key-1', { cidr: ['10.0.0.0/8'] }),
     ]);
-    expect(storedDatabase(container)).toMatchObject({ tokens: [{ user: 'alice' }, { user: 'bob' }] });
+    expect(storedTokens(container)).toMatchObject({ tokens: [{ user: 'alice' }, { user: 'bob' }] });
   });
 
   test('saveToken replaces the token with the same user and key', async () => {
@@ -250,13 +293,13 @@ describe('tokens', () => {
     await expect(plugin.readTokens({ user: 'alice' })).resolves.toEqual([tokenOf('alice', 'key-2')]);
   });
 
-  test('a token the database could not read back is refused with 422 and not stored', async () => {
-    const { plugin, databaseBlob } = setup();
+  test('a token that could not be read back is refused with 422 and not stored', async () => {
+    const { plugin, tokensBlob } = setup();
     // The API checks that cidr_whitelist is an array, not what it holds.
     const unreadable = tokenOf('alice', 'key-1');
     Reflect.set(unreadable, 'cidr', [42]);
     await expect(plugin.saveToken(unreadable)).rejects.toMatchObject({ code: 422 });
-    expect(databaseBlob.uploadData).not.toHaveBeenCalled();
+    expect(tokensBlob.uploadData).not.toHaveBeenCalled();
   });
 });
 

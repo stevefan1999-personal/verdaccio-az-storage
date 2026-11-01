@@ -14,9 +14,12 @@ import {
   Npm,
   readBlob,
   readDatabase,
+  readStoredDocuments,
+  readTokens,
   type StoredBlob,
   startReadDenyingProxy,
   Teardown,
+  TOKENS_BLOB,
   Verdaccio,
   writePackage,
 } from './harness';
@@ -36,7 +39,7 @@ let store: AzureStore;
 let port: number;
 let npm: Npm;
 let apiToken: string;
-let storedDatabase: StoredBlob;
+let storedDocuments: StoredBlob[];
 
 const startVerdaccio = async () => teardown.add(await Verdaccio.start(join(directory, CONTAINER), store, { port }));
 
@@ -66,20 +69,23 @@ describe('Verdaccio start-up when the database cannot be read', () => {
     await npm.exec(['publish'], await writePackage(directory, PACKAGE, VERSION));
     apiToken = (await npm.json(['token', 'create'], CreatedToken)).token;
     await verdaccio.stop();
-    storedDatabase = await readBlob(container, DATABASE_BLOB);
+    storedDocuments = await readStoredDocuments(container);
   });
 
   afterAll(() => teardown.run());
 
-  test('refuses to start when reads of the database are denied, and leaves it as it was', async () => {
-    const proxy = teardown.add(await startReadDenyingProxy(azurite.port, DATABASE_BLOB));
-    expect(await failedStart(CONTAINER, azuriteConnectionString(proxy.port))).toMatchObject({
-      kind: 'exited',
-      exitCode: 1,
-      log: expect.stringContaining('azure request failed: 403 AuthorizationPermissionMismatch'),
-    });
-    expect(await readBlob(container, DATABASE_BLOB)).toEqual(storedDatabase);
-  });
+  test.each([DATABASE_BLOB, TOKENS_BLOB])(
+    'refuses to start when reads of %s are denied, and leaves it as it was',
+    async (deniedBlob) => {
+      const proxy = teardown.add(await startReadDenyingProxy(azurite.port, deniedBlob));
+      expect(await failedStart(CONTAINER, azuriteConnectionString(proxy.port))).toMatchObject({
+        kind: 'exited',
+        exitCode: 1,
+        log: expect.stringContaining('azure request failed: 403 AuthorizationPermissionMismatch'),
+      });
+      expect(await readStoredDocuments(container)).toEqual(storedDocuments);
+    },
+  );
 
   test('refuses to start on a database that is not JSON, and leaves it as it was', async () => {
     const corrupt = azurite.container('corrupt');
@@ -112,10 +118,10 @@ describe('Verdaccio start-up when the database cannot be read', () => {
     });
 
     azurite = teardown.add(await Azurite.start({ location, port: azurite.port }));
-    const kept = await readDatabase(container);
-    // The same bytes and ETag: nothing was written while the read failed.
-    expect(kept).toMatchObject(storedDatabase);
-    expect(kept.database).toMatchObject({ list: [PACKAGE], tokens: [{ user: USER }] });
+    // The same bytes and ETags: nothing was written while the reads failed.
+    expect(await readStoredDocuments(container)).toEqual(storedDocuments);
+    expect((await readDatabase(container)).database.list).toEqual([PACKAGE]);
+    expect((await readTokens(container)).tokens).toMatchObject([{ user: USER }]);
 
     const verdaccio = await startVerdaccio();
     // The token decrypts only with the stored secret, and Verdaccio also looks its key up in the stored tokens.

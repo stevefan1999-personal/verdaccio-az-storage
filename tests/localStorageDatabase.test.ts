@@ -4,6 +4,7 @@ import {
   type ILocalStorageProvider,
   type LocalStorage,
   LocalStorageDatabase,
+  parseLocalStorage,
   StorageBlobLocalStorageProvider,
   type StoredLocalStorage,
   type WriteOutcome,
@@ -11,7 +12,7 @@ import {
 import { azureError, MemoryContainer } from './fakes';
 
 const DATABASE = '.verdaccio-db.json';
-const EMPTY: LocalStorage = { list: [], secret: '', tokens: [] };
+const EMPTY: LocalStorage = { list: [], secret: '' };
 
 const addPackage =
   (name: string) =>
@@ -19,15 +20,16 @@ const addPackage =
 
 function blobDatabase(container = new MemoryContainer()) {
   const blob = container.getBlockBlobClient(DATABASE);
-  return { container, blob, database: new LocalStorageDatabase(new StorageBlobLocalStorageProvider(blob)) };
+  const provider = new StorageBlobLocalStorageProvider(blob, parseLocalStorage);
+  return { container, blob, database: new LocalStorageDatabase(provider, EMPTY) };
 }
 
 function scriptedProvider(outcome: WriteOutcome, stored: StoredLocalStorage = { kind: 'missing' }) {
   const provider = {
     read: vi.fn(async (): Promise<StoredLocalStorage> => stored),
     write: vi.fn(async (_next: LocalStorage, _previous: StoredLocalStorage): Promise<WriteOutcome> => outcome),
-  } satisfies ILocalStorageProvider;
-  return { provider, database: new LocalStorageDatabase(provider) };
+  } satisfies ILocalStorageProvider<LocalStorage>;
+  return { provider, database: new LocalStorageDatabase(provider, EMPTY) };
 }
 
 const storedList = (container: MemoryContainer): unknown => JSON.parse(container.textOf(DATABASE) ?? 'null')?.list;
@@ -37,6 +39,12 @@ describe('LocalStorageDatabase', () => {
     const { database, blob } = blobDatabase();
     await expect(database.read()).resolves.toEqual(EMPTY);
     expect(blob.uploadData).not.toHaveBeenCalled();
+  });
+
+  test('each read of a missing document is a new empty copy', async () => {
+    const { database } = blobDatabase();
+    (await database.read()).list.push('changed-by-a-caller');
+    await expect(database.read()).resolves.toEqual({ list: [], secret: '' });
   });
 
   test('the first change creates the document', async () => {
