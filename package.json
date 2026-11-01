@@ -42,7 +42,8 @@
   },
   "scripts": {
     "build": "rimraf ./lib && tsc",
-    "format": "biome check --write **/*.ts"
+    "lint": "biome check .",
+    "format": "biome check --write ."
   },
   "files": [
     "/lib"
