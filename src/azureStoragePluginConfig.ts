@@ -1,3 +1,4 @@
+import { posix } from 'node:path';
 import * as z from 'zod';
 import { LOGGER_PREFIX } from './constants';
 
@@ -22,10 +23,18 @@ const requiredText = z.string().min(1);
 // 0 means no Cache-Control header, as in 1.x.
 const cacheSeconds = z.coerce.number().int().nonnegative().optional();
 const accountDomain = requiredText.default('blob.core.windows.net');
+// The blob names join this folder with posix.join, which resolves '.' and '..', and the SDK resolves a '..'
+// that is left into another container. A leading '/' would stay as an empty first folder name.
+const packagesDir = requiredText
+  .refine(
+    (folder) => !posix.isAbsolute(folder) && !posix.normalize(folder).split('/').includes('..'),
+    'packagesDir must be a relative folder inside the container',
+  )
+  .default('packages');
 
 const sharedSettings = {
   containerName: requiredText,
-  packagesDir: requiredText.default('packages'),
+  packagesDir,
   cachePackageDataTime: cacheSeconds,
   cachePackageTime: cacheSeconds,
   appConfigConnectionString: requiredText.optional(),

@@ -145,6 +145,24 @@ describe('parseAzureStorageConfig', () => {
     );
   });
 
+  test.each(['../registry', '..', 'packages/../..', '/packages'])(
+    'packagesDir %o, which is absolute or leaves the container, is rejected',
+    (packagesDir) => {
+      expect(() => parseAzureStorageConfig({ ...CONNECTION_STRING_SECTION, packagesDir }, NO_ENVIRONMENT)).toThrow(
+        'packagesDir must be a relative folder inside the container',
+      );
+    },
+  );
+
+  test.each(['./packages', 'nested/packages/', 'old/../packages', '.'])(
+    'packagesDir %o stays inside the container, so it is accepted as 1.x accepted it',
+    (packagesDir) => {
+      expect(parseAzureStorageConfig({ ...CONNECTION_STRING_SECTION, packagesDir }, NO_ENVIRONMENT)).toMatchObject({
+        packagesDir,
+      });
+    },
+  );
+
   test('the plugin section and the whole merged configuration parse the same', () => {
     const merged = {
       storage: './storage',
