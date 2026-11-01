@@ -47,7 +47,7 @@ let store: AzureStore;
 let port: number;
 let verdaccio: Verdaccio;
 let npm: Npm;
-let apiToken: string;
+let tokenUser: Npm;
 
 const viewPackage = (name: string) => npm.json(['view', name], PackageView);
 const viewVersion = (name: string, version: string) => npm.json(['view', `${name}@${version}`], VersionView);
@@ -62,11 +62,6 @@ async function expectServedTarballsMatchIntegrity(name: string, versions: readon
     const { dist } = await viewVersion(name, version);
     expect(await servedIntegrity(dist.tarball)).toBe(dist.integrity);
   }
-}
-
-async function whoamiWith(token: string, purpose: string): Promise<string> {
-  const client = await Npm.create(join(directory, purpose), verdaccio.url, token);
-  return (await client.exec(['whoami'])).trim();
 }
 
 describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
@@ -134,13 +129,14 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
   });
 
   test('creates and lists an npm token, and stores only its mask', async () => {
-    apiToken = (await npm.json(['token', 'create'], CreatedToken)).token;
+    const apiToken = (await npm.json(['token', 'create'], CreatedToken)).token;
+    tokenUser = await Npm.create(join(directory, 'token-user'), verdaccio.url, apiToken);
     const listed = await npm.json(['token', 'list'], ListedTokens);
     expect(listed).toHaveLength(1);
     const { text, database } = await readDatabase(container);
     expect(database.tokens).toEqual([expect.objectContaining({ user: USER, key: listed[0]?.key })]);
     expect(text).not.toContain(apiToken);
-    expect(await whoamiWith(apiToken, 'token-user')).toBe(USER);
+    expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);
   });
 
   test('keeps the packages, the secret and the token after a restart, without rewriting the database', async () => {
@@ -149,8 +145,8 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
     await verdaccio.stop();
     verdaccio = teardown.add(await Verdaccio.start(join(directory, 'verdaccio'), store, { port }));
     expect(await readBlob(container, DATABASE_BLOB)).toEqual(before);
-    // A token is encrypted with the secret, so it only still works if the stored secret was kept.
-    expect(await whoamiWith(apiToken, 'token-user-after-restart')).toBe(USER);
+    // The token decrypts only with the stored secret, and Verdaccio also looks its key up in the stored tokens.
+    expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);
     expect(await npm.json(['token', 'list'], ListedTokens)).toHaveLength(1);
     for (const name of PACKAGES) {
       expect(await viewPackage(name)).toMatchObject({ versions: [FIRST, LATEST], 'dist-tags': { latest: LATEST } });
@@ -159,11 +155,12 @@ describe('npm against Verdaccio 7 with the plugin on Azurite', () => {
     }
   });
 
-  test('revokes the token', async () => {
+  test('revokes the token, which Verdaccio then refuses', async () => {
     const [listed] = await npm.json(['token', 'list'], ListedTokens);
     await npm.exec(['token', 'revoke', z.string().parse(listed?.key)]);
     expect(await npm.json(['token', 'list'], ListedTokens)).toEqual([]);
     expect((await readDatabase(container)).database.tokens).toEqual([]);
+    expect(await tokenUser.run(['whoami'])).toMatchObject({ exitCode: 1, stderr: expect.stringContaining('E403') });
   });
 
   test('unpublishes one version, then the whole package', async () => {

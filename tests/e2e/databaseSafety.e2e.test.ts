@@ -118,7 +118,7 @@ describe('Verdaccio start-up when the database cannot be read', () => {
     expect(kept.database).toMatchObject({ list: [PACKAGE], tokens: [{ user: USER }] });
 
     const verdaccio = await startVerdaccio();
-    // The token is encrypted with the secret, so it only works with the secret that was stored.
+    // The token decrypts only with the stored secret, and Verdaccio also looks its key up in the stored tokens.
     const tokenUser = await Npm.create(join(directory, 'token-user'), verdaccio.url, apiToken);
     expect((await tokenUser.exec(['whoami'])).trim()).toBe(USER);
     expect(await npm.json(['token', 'list'], ListedTokens)).toHaveLength(1);
