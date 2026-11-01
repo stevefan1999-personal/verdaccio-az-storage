@@ -22,28 +22,40 @@
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
+  },
+  "peerDependencies": {
+    "verdaccio": ">=7"
+  },
+  "peerDependenciesMeta": {
+    "verdaccio": {
+      "optional": true
+    }
   },
   "dependencies": {
-    "@azure/app-configuration": "~1.9.0",
-    "@azure/identity": "~4.10.2",
-    "@azure/storage-blob": "~12.27.0",
-    "@verdaccio/commons-api": "~10.2.0",
-    "@verdaccio/streams": "~10.2.1"
+    "@azure/app-configuration": "~1.13.1",
+    "@azure/identity": "~4.14.1",
+    "@azure/storage-blob": "~12.34.0",
+    "@verdaccio/core": "9.0.0-next-9.41",
+    "zod": "~4.6.7"
   },
   "devDependencies": {
     "@biomejs/biome": "2.1.1",
-    "@types/node": "^18.0.0",
-    "@verdaccio/types": "^10.8.0",
+    "@types/node": "^24.19.2",
+    "@verdaccio/plugin-verifier": "1.0.0-next-9.37",
+    "@verdaccio/types": "14.0.0-next-9.18",
     "rimraf": "~6.0.1",
-    "typescript": "~5.8.3",
-    "verdaccio": "~6.1.5",
-    "verdaccio-az-storage": "link:"
+    "typescript": "~5.9.3",
+    "verdaccio": "7.0.2",
+    "verdaccio-az-storage": "link:",
+    "vitest": "5.0.5"
   },
   "scripts": {
-    "build": "rimraf ./lib && tsc",
+    "build": "rimraf ./lib && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
     "lint": "biome check .",
-    "format": "biome check --write ."
+    "format": "biome check --write .",
+    "test": "pnpm build && vitest run"
   },
   "files": [
     "/lib"

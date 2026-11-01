@@ -2,20 +2,12 @@
   "compilerOptions": {
     "target": "ESNext",
     "module": "commonjs",
-    "declaration": true,
-    "allowJs": false,
-    "noImplicitAny": false,
+    "moduleResolution": "node10",
     "strict": true,
-    "outDir": "./lib",
-    "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "sourceMap": true,               // Generate source maps
-    "inlineSources": true,           // Include original source in the source map
-    "inlineSourceMap": false         // Avoid inline source maps for external debugging
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
   },
-  "include": [
-    "src/*.ts",
-    "types/*.ts"
-  ]
+  "include": ["src", "tests", "*.mts"]
 }

@@ -1,50 +1,59 @@
-import { AppConfigurationClient } from '@azure/app-configuration';
-import type { LocalStorage, Logger } from '@verdaccio/types';
-import type { AzureStoragePluginConfig } from '../../azureStoragePluginConfig';
-import type { ILocalStorageProvider } from '../localStorageProvider';
+import { errorUtils, HTTP_STATUS } from '@verdaccio/core';
+import { hasStatus, toVerdaccioError } from '../../azureErrors';
+import {
+  type ILocalStorageProvider,
+  type LocalStorage,
+  parseLocalStorage,
+  type StoredLocalStorage,
+  type WriteOutcome,
+  writeOutcome,
+} from '../localStorageProvider';
 
-/**
- * ILocalStorageProvider that uses Azure App Configuration
- */
+type JsonSetting = { key: string; value: string; contentType: string };
+
+/** The AppConfigurationClient calls this provider makes. The SDK client satisfies it, and the unit tests fake it. */
+export interface AppConfigurationStore {
+  getConfigurationSetting(id: { key: string }): Promise<{ value?: string; etag?: string }>;
+  addConfigurationSetting(setting: JsonSetting): Promise<unknown>;
+  setConfigurationSetting(
+    setting: JsonSetting & { etag: string },
+    options: { onlyIfUnchanged: boolean },
+  ): Promise<unknown>;
+}
+
+/** Keeps the database in one Azure App Configuration key-value. */
 export class AppConfigLocalStorageProvider implements ILocalStorageProvider {
-  private readonly logger: Logger;
-  private readonly client: AppConfigurationClient;
+  private readonly client: AppConfigurationStore;
   private readonly keyName: string;
 
-  constructor(logger: Logger, connectionString: string, config: AzureStoragePluginConfig) {
-    this.logger = logger;
-    this.keyName = config.appConfigKeyName ?? 'verdaccio-db';
-    this.client = new AppConfigurationClient(connectionString);
+  constructor(client: AppConfigurationStore, keyName: string) {
+    this.client = client;
+    this.keyName = keyName;
   }
 
-  public async getLocalStorage(): Promise<LocalStorage | undefined> {
+  async read(): Promise<StoredLocalStorage> {
     try {
-      const setting = await this.client.getConfigurationSetting(
-        {
-          key: this.keyName,
-        },
-        {},
-      );
-
-      const value = setting.value;
-      if (value) {
-        return JSON.parse(value) as LocalStorage;
+      const { value, etag } = await this.client.getConfigurationSetting({ key: this.keyName });
+      // 1.x read an empty value as "missing" and then wrote an empty database over the key.
+      if (!value || etag === undefined) {
+        throw errorUtils.getInternalError('the verdaccio database in App Configuration has no value or no etag');
       }
-    } catch (ex) {
-      //404 error just means that the key doesn't exist
-      if (ex instanceof Error && 'statusCode' in ex && ex.statusCode !== 404) {
-        throw ex;
+      return { kind: 'present', document: parseLocalStorage(value), etag };
+    } catch (error) {
+      if (hasStatus(error, HTTP_STATUS.NOT_FOUND)) {
+        return { kind: 'missing' };
       }
+      throw toVerdaccioError(error);
     }
-
-    return undefined;
   }
 
-  public async saveLocalStorage(localStorage: LocalStorage): Promise<void> {
-    await this.client.setConfigurationSetting({
-      key: this.keyName,
-      value: JSON.stringify(localStorage),
-      contentType: 'application/json',
-    });
+  write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome> {
+    const setting = { key: this.keyName, value: JSON.stringify(next), contentType: 'application/json' };
+    // addConfigurationSetting sends If-None-Match: *, and onlyIfUnchanged sends If-Match with the read ETag.
+    return writeOutcome(
+      previous.kind === 'missing'
+        ? this.client.addConfigurationSetting(setting)
+        : this.client.setConfigurationSetting({ ...setting, etag: previous.etag }, { onlyIfUnchanged: true }),
+    );
   }
 }

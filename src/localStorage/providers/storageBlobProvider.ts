@@ -1,50 +1,32 @@
-import type { BlockBlobClient, ContainerClient } from '@azure/storage-blob';
-import type { LocalStorage, Logger } from '@verdaccio/types';
-import { LOGGER_PREFIX } from '../../constants';
-import type { ILocalStorageProvider } from '../localStorageProvider';
+import { type PluginBlob, readBlobDocument } from '../../storedDocument';
+import {
+  type ILocalStorageProvider,
+  type LocalStorage,
+  parseLocalStorage,
+  type StoredLocalStorage,
+  type WriteOutcome,
+  writeOutcome,
+} from '../localStorageProvider';
 
-const DB_FILE_NAME = '.verdaccio-db.json';
-
-/**
- * ILocalStorageProvider that uses blob in an Azure storage container
- */
+/** Keeps the database in `.verdaccio-db.json` at the container root. */
 export class StorageBlobLocalStorageProvider implements ILocalStorageProvider {
-  private logger: Logger;
-  private localStorageBlobClient: BlockBlobClient;
+  private readonly blob: PluginBlob;
 
-  constructor(logger: Logger, containerClient: ContainerClient) {
-    this.logger = logger;
-    try {
-      this.localStorageBlobClient = containerClient.getBlockBlobClient(DB_FILE_NAME);
-    } catch (ex) {
-      this.logger.error(
-        { dbFile: DB_FILE_NAME, ex },
-        `${LOGGER_PREFIX}: Error creating Azure storage blob client for @{dbFile}! @{ex}`,
-      );
-      throw ex;
-    }
+  constructor(blob: PluginBlob) {
+    this.blob = blob;
   }
 
-  public async getLocalStorage(): Promise<LocalStorage | undefined> {
-    const exists = await this.localStorageBlobClient.exists();
-    if (exists) {
-      //DB file exists in container, fetch it
-      this.logger.debug(`${LOGGER_PREFIX}: Getting local storage...`);
-      const blob = await this.localStorageBlobClient.downloadToBuffer();
-      const jsonRaw = blob.toString('utf-8');
-
-      return JSON.parse(jsonRaw) as LocalStorage;
-    }
-
-    return undefined;
+  read(): Promise<StoredLocalStorage> {
+    return readBlobDocument(this.blob, parseLocalStorage);
   }
 
-  public async saveLocalStorage(localStorage: LocalStorage): Promise<void> {
-    const jsonBuffer = Buffer.from(JSON.stringify(localStorage), 'utf-8');
-    await this.localStorageBlobClient.uploadData(jsonBuffer, {
-      blobHTTPHeaders: {
-        blobContentType: 'application/json',
-      },
-    });
+  write(next: LocalStorage, previous: StoredLocalStorage): Promise<WriteOutcome> {
+    // One Put Blob: a reader sees the old document or the new one, never a mix.
+    return writeOutcome(
+      this.blob.uploadData(Buffer.from(JSON.stringify(next)), {
+        blobHTTPHeaders: { blobContentType: 'application/json' },
+        conditions: previous.kind === 'missing' ? { ifNoneMatch: '*' } : { ifMatch: previous.etag },
+      }),
+    );
   }
 }

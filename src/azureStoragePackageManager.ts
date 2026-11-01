@@ -1,264 +1,192 @@
-import { join } from 'node:path';
-import type { BlobHTTPHeaders, BlockBlobClient, ContainerClient } from '@azure/storage-blob';
-import { getConflict, getNotFound, HEADERS } from '@verdaccio/commons-api';
-import { ReadTarball, UploadTarball } from '@verdaccio/streams';
-import type {
-  CallbackAction,
-  ILocalPackageManager,
-  IUploadTarball,
-  Logger,
-  Manifest,
-  Package,
-  PackageTransformer,
-  ReadPackageCallback,
-  StorageUpdateCallback,
-  StorageWriteCallback,
-} from '@verdaccio/types';
-import type { AzureStoragePluginConfig } from './azureStoragePluginConfig';
+import { posix } from 'node:path';
+import { addAbortSignal, PassThrough, pipeline, type Readable, type Stream, Writable } from 'node:stream';
+import type { BlobHTTPHeaders, BlobRequestConditions } from '@azure/storage-blob';
+import { errorUtils, HEADER_TYPE, type pluginUtils } from '@verdaccio/core';
+import type { Logger, Manifest } from '@verdaccio/types';
+import * as z from 'zod';
+import { toVerdaccioError, withVerdaccioErrors } from './azureErrors';
+import type { AzureStorageConfig } from './azureStoragePluginConfig';
 import { LOGGER_PREFIX } from './constants';
+import type { PackageUpdates } from './packageUpdates';
+import { type PluginBlob, type PluginContainer, parseJsonDocument, readBlobDocument } from './storedDocument';
 
-export default class AzureStoragePackageManager implements ILocalPackageManager {
-  public logger: Logger;
+const MANIFEST_FILE_NAME = 'package.json';
+const MANIFEST_CONTENT_TYPE = 'application/json';
+const TARBALL_CONTENT_TYPE = 'application/x-compressed-tar';
+const UNSAFE_SEGMENTS: ReadonlySet<string> = new Set(['', '.', '..']);
 
+// The store also keeps documents that are not manifests here (the stage index), so only an object is required.
+const ManifestSchema = z.custom<Manifest>(
+  (value) => typeof value === 'object' && value !== null && !Array.isArray(value),
+  'expected a JSON object',
+);
+
+const parseManifest = (text: string): Manifest => parseJsonDocument(text, ManifestSchema, 'package metadata');
+
+const httpHeaders = (blobContentType: string, cacheSeconds: number | undefined): BlobHTTPHeaders =>
+  cacheSeconds ? { blobContentType, blobCacheControl: `public, max-age=${cacheSeconds}` } : { blobContentType };
+
+/** One package: `<packagesDir>/<name>/package.json` and its tarballs, the same layout as 1.x. */
+export default class AzureStoragePackageManager implements pluginUtils.StorageHandler {
+  readonly logger: Logger;
   private readonly packageName: string;
-  private readonly config: AzureStoragePluginConfig;
-  private readonly containerClient: ContainerClient;
-  private readonly packageBlobClient: BlockBlobClient;
+  private readonly config: AzureStorageConfig;
+  private readonly container: PluginContainer;
+  private readonly updates: PackageUpdates;
+  private readonly manifestBlobName: string;
 
-  public constructor(
+  constructor(
     packageName: string,
-    config: AzureStoragePluginConfig,
+    config: AzureStorageConfig,
     logger: Logger,
-    containerClient: ContainerClient,
+    container: PluginContainer,
+    updates: PackageUpdates,
   ) {
-    this.logger = logger;
-
     this.packageName = packageName;
     this.config = config;
-    this.containerClient = containerClient;
-
-    const packagePath = join(this.config.packagesDir, packageName, 'package.json');
-    this.logger.debug({ packagePath }, `${LOGGER_PREFIX}: Got package from @{packagePath}`);
-    this.packageBlobClient = containerClient.getBlockBlobClient(packagePath);
+    this.logger = logger;
+    this.container = container;
+    this.updates = updates;
+    this.manifestBlobName = this.blobName(MANIFEST_FILE_NAME);
   }
 
-  /**
-   * Writes package's tarball
-   */
-  public writeTarball(name: string): IUploadTarball {
-    const uploadStream = new UploadTarball({});
-    uploadStream.pause();
-    const packagePath = join(this.config.packagesDir, this.packageName, name);
-
-    const packageClient = this.containerClient.getBlockBlobClient(packagePath);
-
-    //Setup headers
-    const httpHeaders: BlobHTTPHeaders = {
-      blobContentType: 'application/x-compressed-tar',
-    };
-    if (this.config.cachePackageTime) {
-      httpHeaders.blobCacheControl = `public,max-time=${this.config.cachePackageTime}`;
-      this.logger.debug(`${LOGGER_PREFIX}: Using ${this.config.cachePackageTime} seconds as cache-control on package`);
-    }
-
-    //Timeout to allow streams to be ready
-    setTimeout(() => {
-      uploadStream.resume();
-      this.logger.info({ packagePath }, `${LOGGER_PREFIX}: Uploading package to @{packagePath}`);
-      packageClient
-        .uploadStream(uploadStream, undefined, undefined, {
-          blobHTTPHeaders: httpHeaders,
-        })
-        .then(() => {
-          uploadStream.emit('success');
-          this.logger.info({ packagePath }, `${LOGGER_PREFIX}: Finished uploading package to @{packagePath}`);
-        })
-        .catch((error) => uploadStream.emit('error', error));
-      uploadStream.emit('open');
-    }, 1);
-
-    return uploadStream;
+  async readPackage(): Promise<Manifest> {
+    return (await this.readManifest()).document;
   }
 
-  /**
-   * Read's package's tarball
-   */
-  public readTarball(name: string): ReadTarball {
-    const readTarballStream = new ReadTarball({});
-    const packagePath = join(this.config.packagesDir, this.packageName, name);
+  hasPackage(): Promise<boolean> {
+    return withVerdaccioErrors(this.blob(MANIFEST_FILE_NAME).exists());
+  }
 
-    const client = this.containerClient.getBlobClient(packagePath);
-    client
-      .exists()
-      .then((exists) => {
-        if (!exists) {
-          readTarballStream.emit('error', getNotFound());
-          this.logger.warn({ packagePath }, `${LOGGER_PREFIX}: Package @{packagePath} does not exist.`);
+  createPackage(_packageName: string, manifest: Manifest): Promise<void> {
+    // If-None-Match: * makes the second of two concurrent creates fail instead of replacing the first.
+    return this.saveManifest(manifest, { ifNoneMatch: '*' });
+  }
+
+  savePackage(_packageName: string, manifest: Manifest): Promise<void> {
+    return this.saveManifest(manifest, this.updates.conditionsFor(this.manifestBlobName));
+  }
+
+  updatePackage(_packageName: string, handleUpdate: (manifest: Manifest) => Promise<Manifest>): Promise<Manifest> {
+    // The store saves inside handleUpdate, so the save carries If-Match with the ETag read here.
+    // A 412 becomes a 409 without a retry: the store's update callbacks are not safe to run twice.
+    return this.updates.update(this.manifestBlobName, () => this.readManifest(), handleUpdate);
+  }
+
+  async deletePackage(fileName: string): Promise<void> {
+    // Idempotent, so an unpublish that failed halfway can be retried.
+    await withVerdaccioErrors(this.blob(fileName).deleteIfExists());
+  }
+
+  async removePackage(): Promise<void> {
+    // A container has no folders: the package is gone once its blobs are deleted.
+  }
+
+  hasTarball(fileName: string): Promise<boolean> {
+    return withVerdaccioErrors(this.blob(fileName).exists());
+  }
+
+  async readTarball(fileName: string, { signal }: { signal: AbortSignal }): Promise<Readable> {
+    const blob = this.blob(fileName);
+    const tarball = this.observed(fileName, addAbortSignal(signal, new PassThrough()));
+    blob
+      .download(0, undefined, { abortSignal: signal })
+      .then(({ contentLength, readableStreamBody }) => {
+        if (readableStreamBody === undefined) {
+          throw errorUtils.getInternalError('azure answered a tarball download without a body');
+        }
+        // The store copies content-length into the response headers only while they are unsent.
+        if (contentLength !== undefined) {
+          tarball.emit(HEADER_TYPE.CONTENT_LENGTH, contentLength);
+        }
+        tarball.emit('open');
+        // pipeline destroys the tarball with a body error as it is: mapping it to 404 here would make the
+        // store refetch from the uplink into a response that already sent data.
+        pipeline(readableStreamBody, tarball, () => undefined);
+      })
+      // A missing blob arrives as an error event with code 404, which the store answers from the uplink.
+      .catch((error: unknown) => tarball.destroy(toVerdaccioError(error)));
+    return tarball;
+  }
+
+  async writeTarball(fileName: string, { signal }: { signal: AbortSignal }): Promise<Writable> {
+    const blob = this.blob(fileName);
+    const source = this.observed(fileName, new PassThrough());
+    // uploadStream stages blocks and commits the block list only after the source ends, so a reader
+    // never sees a partial tarball and a cancelled upload leaves no blob.
+    const commit = blob.uploadStream(source, undefined, undefined, {
+      abortSignal: signal,
+      blobHTTPHeaders: httpHeaders(TARBALL_CONTENT_TYPE, this.config.cachePackageTime),
+    });
+    const tarball: Writable = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        if (source.write(chunk)) {
+          callback();
         } else {
-          //With tarball_url_redirect enabled, just emit an open event so Verdaccio will redirect
-          if ('experiments' in this.config && 'tarball_url_redirect' in this.config.experiments) {
-            readTarballStream.emit('open');
-            return;
-          }
-
-          client.download().then((result) => {
-            this.logger.debug(`${LOGGER_PREFIX}: Finished downloading package tarball, piping to stream.`);
-            readTarballStream.emit('open');
-            readTarballStream.emit(HEADERS.CONTENT_LENGTH, result.contentLength);
-            result.readableStreamBody!.pipe(readTarballStream);
-          });
+          source.once('drain', () => callback());
         }
-      })
-      .catch((error) => {
-        this.logger.error({ error }, `${LOGGER_PREFIX}: Error reading package tarball! @{error}`);
-        readTarballStream.emit('error', error);
-      });
-
-    return readTarballStream;
-  }
-
-  /**
-   * Reads package data
-   */
-  public readPackage(fileName: string, callback: ReadPackageCallback): void {
-    this.logger.debug({ fileName }, `${LOGGER_PREFIX}: readPackage for package @{fileName}`);
-
-    this.getPackageData()
-      .then((packageData) => {
-        this.logger.debug(`${LOGGER_PREFIX}: Finished reading package data`);
-        callback(null, packageData);
-      })
-      .catch((error) => {
-        this.logger.error({ error }, `${LOGGER_PREFIX}: Error reading package data: @{error}`);
+      },
+      final(callback) {
+        source.end();
+        // 'finish', and so the store's metadata update, waits for the committed blob.
+        commit.then(
+          () => callback(),
+          (error: unknown) => callback(toVerdaccioError(error)),
+        );
+      },
+      destroy(error, callback) {
+        // uploadStream never settles when its source closes without an error, so a cancel always passes one.
+        if (!tarball.writableFinished) {
+          source.destroy(error ?? errorUtils.getInternalError('tarball upload cancelled'));
+        }
         callback(error);
-      });
-  }
-
-  /**
-   * Creates package data
-   */
-  public createPackage(pkgName: string, value: Manifest, cb: CallbackAction): void {
-    this.logger.debug({ pkgName }, `${LOGGER_PREFIX}: createPackage for package @{pkgName}`);
-
-    this.packageBlobClient
-      .exists()
-      .then((exists) => {
-        //Make sure package doesn't already exist
-        if (exists) {
-          cb(getConflict('Package data already exists'));
-          return;
-        }
-
-        this.savePackage(pkgName, value, cb);
-      })
-      .catch((error) => {
-        this.logger.error({ error }, `${LOGGER_PREFIX}: Error creating package data: @{error}`);
-        cb(error);
-      });
-  }
-
-  /**
-   * Deletes package data
-   */
-  public deletePackage(fileName: string, callback: CallbackAction): void {
-    const packageClient = this.containerClient.getBlockBlobClient(
-      join(this.config.packagesDir, this.packageName, fileName),
-    );
-    packageClient
-      .delete()
-      .then(() => {
-        this.logger.debug(`${LOGGER_PREFIX}: Finished deleting package data`);
-        callback(null);
-      })
-      .catch((error) => {
-        this.logger.error({ error }, `${LOGGER_PREFIX}: Error deleting package data: @{error}`);
-        callback(error);
-      });
-  }
-
-  public removePackage(callback: CallbackAction): void {
-    callback(null);
-  }
-
-  /**
-   * Updates package data
-   */
-  public updatePackage(
-    name: string,
-    updateHandler: StorageUpdateCallback,
-    onWrite: StorageWriteCallback,
-    transformPackage: PackageTransformer,
-    onEnd: CallbackAction,
-  ): void {
-    this.getPackageData().then((packageData) => {
-      updateHandler(packageData, (error) => {
-        if (error) {
-          this.logger.error({ error }, `${LOGGER_PREFIX}: Error updating package data: @{error}`);
-          onEnd(error);
-          return;
-        }
-
-        const transformedPackage = transformPackage(packageData);
-        onWrite(name, transformedPackage, onEnd);
-      });
+      },
     });
+    // A failed block upload pauses the source, so a write waiting for 'drain' would wait forever.
+    commit.catch((error: unknown) => tarball.destroy(toVerdaccioError(error)));
+    return this.observed(fileName, addAbortSignal(signal, tarball));
   }
 
-  /**
-   * Saves package data
-   */
-  public savePackage(_fileName: string, json: Manifest, callback: CallbackAction): void {
-    this.writePackageData(json)
-      .then(() => {
-        this.logger.debug(`${LOGGER_PREFIX}: Finished saving package data`);
-        callback(null);
-      })
-      .catch((error) => {
-        this.logger.error({ error }, `${LOGGER_PREFIX}: Error saving package data: @{error}`);
-        callback(error);
-      });
-  }
-
-  private async getPackageData(): Promise<Package> {
-    const exists = await this.packageBlobClient.exists();
-    let packageData: Package;
-    if (exists) {
-      //Read package data
-      const blob = await this.packageBlobClient.downloadToBuffer();
-      const jsonRaw = blob.toString('utf-8');
-      packageData = JSON.parse(jsonRaw) as Package;
-    } else {
-      //Precreate
-      packageData = {
-        name: this.packageName,
-        versions: {},
-        'dist-tags': {},
-        _distfiles: {},
-        _attachments: {},
-        _uplinks: {},
-        _rev: '',
-      };
-    }
-
-    return packageData;
-  }
-
-  private async writePackageData(packageData: Package): Promise<void> {
-    const jsonBuffer = Buffer.from(JSON.stringify(packageData), 'utf-8');
-
-    const httpHeaders: BlobHTTPHeaders = {
-      blobContentType: 'application/json',
-    };
-
-    if (this.config.cachePackageDataTime) {
-      httpHeaders.blobCacheControl = `public,max-time=${this.config.cachePackageDataTime}`;
+  // A stream can error before anyone listens to it (an aborted signal, a failed request, or the upload
+  // source after its upload failed), and an 'error' event without a listener would end the process.
+  private observed<Tarball extends Stream>(fileName: string, tarball: Tarball): Tarball {
+    tarball.on('error', (error: Error) => {
       this.logger.debug(
-        `${LOGGER_PREFIX}: Using ${this.config.cachePackageDataTime} seconds as cache-control on package data`,
+        { fileName, error: error.message },
+        `${LOGGER_PREFIX}: tarball stream @{fileName} failed: @{error}`,
       );
-    }
-
-    await this.packageBlobClient.uploadData(jsonBuffer, {
-      blobHTTPHeaders: httpHeaders,
     });
+    return tarball;
+  }
+
+  private async readManifest(): Promise<{ document: Manifest; etag: string }> {
+    const stored = await readBlobDocument(this.blob(MANIFEST_FILE_NAME), parseManifest);
+    if (stored.kind === 'missing') {
+      throw errorUtils.getNotFound();
+    }
+    return stored;
+  }
+
+  private async saveManifest(manifest: Manifest, conditions: BlobRequestConditions): Promise<void> {
+    await withVerdaccioErrors(
+      this.blob(MANIFEST_FILE_NAME).uploadData(Buffer.from(JSON.stringify(manifest)), {
+        blobHTTPHeaders: httpHeaders(MANIFEST_CONTENT_TYPE, this.config.cachePackageDataTime),
+        conditions,
+      }),
+    );
+  }
+
+  private blob(fileName: string): PluginBlob {
+    return this.container.getBlockBlobClient(this.blobName(fileName));
+  }
+
+  private blobName(fileName: string): string {
+    const relativeName = `${this.packageName}/${fileName}`;
+    // Verdaccio validates names before they reach storage. This keeps one that slipped through from
+    // escaping packagesDir, where it could reach the database blob at the container root.
+    if (relativeName.split('/').some((segment) => UNSAFE_SEGMENTS.has(segment))) {
+      throw errorUtils.getInternalError('the package or file name is not a safe blob name');
+    }
+    return posix.join(this.config.packagesDir, relativeName);
   }
 }

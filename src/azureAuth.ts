@@ -1,59 +1,33 @@
+import { AppConfigurationClient } from '@azure/app-configuration';
 import { DefaultAzureCredential } from '@azure/identity';
-import { BlobServiceClient, type ContainerClient, StorageSharedKeyCredential } from '@azure/storage-blob';
-import type { Logger } from '@verdaccio/types';
-import { LOGGER_PREFIX } from './constants';
+import { BlobServiceClient, StorageSharedKeyCredential } from '@azure/storage-blob';
+import type { AzureStorageConfig } from './azureStoragePluginConfig';
+import type { AppConfigurationStore } from './localStorage';
+import type { PluginContainer } from './storedDocument';
 
-export function setupConnectionStringAuth(
-  logger: Logger,
-  connectionString: string,
-  containerName: string,
-): { blobClient: BlobServiceClient; containerClient: ContainerClient } {
-  if (!connectionString) {
-    logger.error(`${LOGGER_PREFIX}: Connection string is required!`);
-    throw new Error('Connection string is required!');
-  }
+const accountUrl = ({ accountName, accountDomain }: { accountName: string; accountDomain: string }): string =>
+  `https://${accountName}.${accountDomain}`;
 
-  try {
-    const blobClient = BlobServiceClient.fromConnectionString(connectionString);
-    const containerClient = blobClient.getContainerClient(containerName);
-    return { blobClient, containerClient };
-  } catch (ex) {
-    logger.error({ ex }, `${LOGGER_PREFIX}: Error creating Azure blob client! @{ex}`);
-    throw ex;
+function createServiceClient(config: AzureStorageConfig): BlobServiceClient {
+  switch (config.authMethod) {
+    case 'ConnectionString':
+      return BlobServiceClient.fromConnectionString(config.connectionString);
+    case 'StorageSharedKeyCredential':
+      return new BlobServiceClient(
+        accountUrl(config),
+        new StorageSharedKeyCredential(config.accountName, config.accountKey),
+      );
+    case 'DefaultAzureCredential':
+      return new BlobServiceClient(accountUrl(config), new DefaultAzureCredential());
   }
 }
 
-export function setupDefaultAzureCredentialAuth(
-  logger: Logger,
-  accountName: string,
-  containerName: string,
-  accountDomain: string,
-): { blobClient: BlobServiceClient; containerClient: ContainerClient } {
-  try {
-    const credential = new DefaultAzureCredential();
-    const blobClient = new BlobServiceClient(`https://${accountName}.${accountDomain}`, credential);
-    const containerClient = blobClient.getContainerClient(containerName);
-    return { blobClient, containerClient };
-  } catch (ex) {
-    logger.error({ ex }, `${LOGGER_PREFIX}: Error creating Azure blob client with Azure CLI authentication! @{ex}`);
-    throw ex;
-  }
+/** Creates the container client. Construction does no I/O; credentials are only used by the first request. */
+export function createContainerClient(config: AzureStorageConfig): PluginContainer {
+  return createServiceClient(config).getContainerClient(config.containerName);
 }
 
-export function setupStorageSharedKeyCredential(
-  logger: Logger,
-  accountName: string,
-  accountKey: string,
-  containerName: string,
-  accountDomain: string,
-): { blobClient: BlobServiceClient; containerClient: ContainerClient } {
-  try {
-    const credential = new StorageSharedKeyCredential(accountName, accountKey);
-    const blobClient = new BlobServiceClient(`https://${accountName}.${accountDomain}`, credential);
-    const containerClient = blobClient.getContainerClient(containerName);
-    return { blobClient, containerClient };
-  } catch (ex) {
-    logger.error({ ex }, `${LOGGER_PREFIX}: Error creating Azure blob client with managed identity! @{ex}`);
-    throw ex;
-  }
+/** Creates the App Configuration client that keeps the database when `appConfigConnectionString` is set. */
+export function createAppConfigurationStore(connectionString: string): AppConfigurationStore {
+  return new AppConfigurationClient(connectionString);
 }

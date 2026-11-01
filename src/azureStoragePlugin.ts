@@ -1,284 +1,143 @@
-import { join } from 'node:path';
-import type { BlobServiceClient, ContainerClient } from '@azure/storage-blob';
-import type {
-  Config,
-  IPackageStorage,
-  IPluginStorage,
-  LocalStorage,
-  Logger,
-  onEndSearchPackage,
-  PluginOptions,
-  Token,
-} from '@verdaccio/types';
-import {
-  setupConnectionStringAuth,
-  setupDefaultAzureCredentialAuth,
-  setupStorageSharedKeyCredential,
-} from './azureAuth';
+import { errorUtils, pluginUtils, type searchUtils } from '@verdaccio/core';
+import type { Logger, Token, TokenFilter } from '@verdaccio/types';
+import * as z from 'zod';
+import { createAppConfigurationStore, createContainerClient } from './azureAuth';
 import AzureStoragePackageManager from './azureStoragePackageManager';
-import type { AzureStoragePluginConfig } from './azureStoragePluginConfig';
+import { type AzureStorageConfig, parseAzureStorageConfig } from './azureStoragePluginConfig';
 import { LOGGER_PREFIX } from './constants';
 import {
   AppConfigLocalStorageProvider,
   type ILocalStorageProvider,
+  LocalStorageDatabase,
   StorageBlobLocalStorageProvider,
+  TokenSchema,
 } from './localStorage';
+import { PackageUpdates } from './packageUpdates';
+import type { PluginContainer } from './storedDocument';
 
-export class AzureStoragePlugin implements IPluginStorage<AzureStoragePluginConfig> {
-  public logger: Logger;
-  public config: AzureStoragePluginConfig & Config;
-  public version?: string | undefined;
+const DATABASE_BLOB_NAME = '.verdaccio-db.json';
+const SEARCH_SCORE: searchUtils.Score = { final: 1, detail: { quality: 1, popularity: 1, maintenance: 0 } };
 
-  private localStorage?: LocalStorage;
-
-  private azureBlobClient: BlobServiceClient;
-  private azureContainerClient: ContainerClient;
-
-  private localStorageProvider: ILocalStorageProvider;
-
-  public constructor(config: Config, options: PluginOptions<AzureStoragePluginConfig>) {
-    this.logger = options.logger;
-
-    if (!config) {
-      this.logger.error('Config for Azure storage plugin is missing! Add `store.az-storage` to your config file!');
-      throw new Error();
-    }
-
-    //Copy config
-    this.config = Object.assign(config, config.store['az-storage']);
-
-    const authMethod = process.env.AZ_STORAGE_AUTH_METHOD || this.config.authMethod || 'ConnectionString';
-    const containerName = process.env.AZ_STORAGE_CONTAINER_NAME || this.config.containerName;
-    const accountName = process.env.AZ_STORAGE_ACCOUNT_NAME || this.config.accountName;
-    const accountKey = process.env.AZ_STORAGE_ACCOUNT_KEY || this.config.accountKey;
-    const accountDomain = process.env.AZ_STORAGE_ACCOUNT_DOMAIN || this.config.accountDomain || 'blob.core.windows.net';
-
-    switch (authMethod) {
-      case 'ConnectionString': {
-        const { blobClient, containerClient } = setupConnectionStringAuth(
-          this.logger,
-          process.env.AZ_STORAGE_CONNECTION_STRING || this.config.connectionString!,
-          containerName,
-        );
-        this.azureBlobClient = blobClient;
-        this.azureContainerClient = containerClient;
-        break;
-      }
-
-      case 'DefaultAzureCredential': {
-        if (!accountName) {
-          throw new Error('Account name is required!');
-        }
-        const { blobClient, containerClient } = setupDefaultAzureCredentialAuth(
-          this.logger,
-          accountName,
-          containerName,
-          accountDomain,
-        );
-        this.azureBlobClient = blobClient;
-        this.azureContainerClient = containerClient;
-        break;
-      }
-
-      case 'StorageSharedKeyCredential': {
-        if (!accountName) {
-          throw new Error('Account name is required!');
-        }
-        if (!accountKey) {
-          throw new Error('Account key is required!');
-        }
-        const { blobClient, containerClient } = setupStorageSharedKeyCredential(
-          this.logger,
-          accountName,
-          accountKey,
-          containerName,
-          accountDomain,
-        );
-        this.azureBlobClient = blobClient;
-        this.azureContainerClient = containerClient;
-        break;
-      }
-
-      default:
-        this.logger.error(`${LOGGER_PREFIX}: Unsupported authentication method: ${authMethod}`);
-        throw new Error(`Unsupported authentication method: ${authMethod}`);
-    }
-
-    //Create local storage provider
-    const appConfigConnectionString =
-      process.env.AZ_STORAGE_APP_CONFIG_CONNECTION_STRING ?? this.config.appConfigConnectionString;
-    if (appConfigConnectionString) {
-      this.localStorageProvider = new AppConfigLocalStorageProvider(
-        this.logger,
-        appConfigConnectionString,
-        this.config,
+function createDatabaseProvider(config: AzureStorageConfig, container: PluginContainer): ILocalStorageProvider {
+  return config.appConfigConnectionString === undefined
+    ? new StorageBlobLocalStorageProvider(container.getBlockBlobClient(DATABASE_BLOB_NAME))
+    : new AppConfigLocalStorageProvider(
+        createAppConfigurationStore(config.appConfigConnectionString),
+        config.appConfigKeyName,
       );
-      this.logger.info(`${LOGGER_PREFIX}: Using Azure app configuration for local storage`);
-    } else {
-      this.localStorageProvider = new StorageBlobLocalStorageProvider(this.logger, this.azureContainerClient);
-      this.logger.info(`${LOGGER_PREFIX}: Using Azure storage blob for local storage`);
-    }
+}
 
-    //Default value for packagesDir
-    if (!this.config.packagesDir) this.config.packagesDir = 'packages';
+const isSameToken = (token: Pick<Token, 'user' | 'key'>, user: string, key: string): boolean =>
+  token.user === user && token.key === key;
+
+/**
+ * Verdaccio 7 storage plugin. The methods use the promise contract (`get()` takes no callback),
+ * so Verdaccio does not wrap the plugin in its fail-open legacy adapter.
+ */
+export class AzureStoragePlugin
+  extends pluginUtils.Plugin<AzureStorageConfig>
+  implements pluginUtils.Storage<AzureStorageConfig>
+{
+  readonly logger: Logger;
+  private readonly settings: AzureStorageConfig;
+  private readonly container: PluginContainer;
+  private readonly database: LocalStorageDatabase;
+  // Shared by every handler, because the store saves a manifest through a new handler.
+  private readonly packageUpdates = new PackageUpdates();
+
+  /** `config` is the plugin section, or the whole configuration merged with it. No I/O happens here. */
+  constructor(config: unknown, options: pluginUtils.PluginOptions) {
+    const settings = parseAzureStorageConfig(config, process.env);
+    super(settings, options);
+    this.settings = settings;
+    this.logger = options.logger;
+    this.container = createContainerClient(settings);
+    this.database = new LocalStorageDatabase(createDatabaseProvider(settings, this.container));
+    this.logger.info(
+      {
+        containerName: settings.containerName,
+        database: settings.appConfigConnectionString === undefined ? DATABASE_BLOB_NAME : 'App Configuration',
+      },
+      `${LOGGER_PREFIX}: container @{containerName}, verdaccio database in @{database}`,
+    );
   }
 
-  /**
-   * Adds a package to the list
-   */
-  public add(name: string, callback: Function): void {
-    this.getOrCreateLocalStorage().then(async (data) => {
-      if (data.list.indexOf(name) === -1) {
-        data.list.push(name);
-        this.logger.debug({ name }, `${LOGGER_PREFIX}: Added package @{name}`);
-        try {
-          await this.writeLocalStorage();
-          callback(null);
-        } catch (err) {
-          callback(err);
-        }
-      } else {
-        callback(null);
+  /** Reads the database once, so a database that cannot be read stops Verdaccio before it serves. */
+  async init(): Promise<void> {
+    await this.database.read();
+  }
+
+  async getSecret(): Promise<string> {
+    return (await this.database.read()).secret;
+  }
+
+  setSecret(secret: string): Promise<void> {
+    return this.database.update((current) => {
+      if (current.secret === secret) {
+        return current;
       }
+      // Two first starts raced with different generated secrets; a restart reads the stored one.
+      if (current.secret !== '') {
+        throw errorUtils.getConflict('a different verdaccio secret is already stored');
+      }
+      return { ...current, secret };
     });
   }
 
-  /**
-   * Removes a package from the list
-   */
-  public remove(name: string, callback: Function): void {
-    this.getOrCreateLocalStorage().then(async (data) => {
-      const pkgIndex = data.list.indexOf(name);
-      if (pkgIndex !== -1) {
-        data.list.splice(pkgIndex, 1);
-        this.logger.debug({ name }, `${LOGGER_PREFIX}: Removed package @{name}`);
-      }
-
-      try {
-        await this.writeLocalStorage();
-        callback(null);
-      } catch (err) {
-        callback(err);
-      }
-    });
+  async get(): Promise<string[]> {
+    return (await this.database.read()).list;
   }
 
-  /**
-   * Gets package list
-   */
-  public get(callback: Function): void {
-    this.getOrCreateLocalStorage().then((storage) => callback(null, storage.list));
+  add(packageName: string): Promise<void> {
+    return this.database.update((current) =>
+      current.list.includes(packageName) ? current : { ...current, list: [...current.list, packageName] },
+    );
   }
 
-  /**
-   * Get Verdaccio's secret
-   */
-  public async getSecret(): Promise<string> {
-    return (await this.getOrCreateLocalStorage()).secret;
+  remove(packageName: string): Promise<void> {
+    return this.database.update((current) => ({
+      ...current,
+      list: current.list.filter((listed) => listed !== packageName),
+    }));
   }
 
-  /**
-   * Sets Verdaccio's secret
-   */
-  public async setSecret(secret: string): Promise<void> {
-    (await this.getOrCreateLocalStorage()).secret = secret;
-
-    await this.writeLocalStorage();
+  /** Private packages only, as in 1.x; the store reads each manifest itself. */
+  async search(query: searchUtils.SearchQuery): Promise<searchUtils.SearchItem[]> {
+    return (await this.get())
+      .filter((packageName) => packageName.includes(query.text))
+      .map((packageName) => ({
+        package: { name: packageName },
+        verdaccioPrivate: true,
+        verdaccioPkgCached: false,
+        score: SEARCH_SCORE,
+      }));
   }
 
-  /**
-   * Gets IPackageStorage for a package
-   */
-  public getPackageStorage(packageInfo: string): IPackageStorage {
-    return new AzureStoragePackageManager(packageInfo, this.config, this.logger, this.azureContainerClient);
+  getPackageStorage(packageName: string): pluginUtils.StorageHandler {
+    return new AzureStoragePackageManager(packageName, this.settings, this.logger, this.container, this.packageUpdates);
   }
 
-  /**
-   * Searching
-   */
-  public async search(onPackage: Function, onEnd: onEndSearchPackage): Promise<void> {
-    try {
-      const localStorage = await this.getOrCreateLocalStorage();
-      const packageList = localStorage.list as string[];
-
-      this.logger.debug({ count: packageList.length }, `${LOGGER_PREFIX}: Got @{count} packages for searching.`);
-
-      const storageInfoMap = packageList.map(this.searchFetchInfo.bind(this, onPackage));
-      await Promise.all(storageInfoMap);
-      onEnd();
-    } catch (ex) {
-      onEnd(ex);
+  /** Upserts by user and key. Tokens live next to the secret, which encrypts the two-factor records. */
+  async saveToken(token: Token): Promise<void> {
+    // Validated before it is stored: a record the read schema rejects would make the database unreadable.
+    const parsed = TokenSchema.safeParse(token);
+    if (!parsed.success) {
+      throw errorUtils.getBadData(`the token cannot be stored\n${z.prettifyError(parsed.error)}`);
     }
+    await this.database.update((current) => ({
+      ...current,
+      tokens: [...current.tokens.filter((existing) => !isSameToken(existing, token.user, token.key)), parsed.data],
+    }));
   }
 
-  private async searchFetchInfo(onPackage: Function, packageName: string): Promise<void> {
-    return new Promise((resolve) => {
-      const packagePath = join(this.config.packagesDir, packageName, 'package.json');
-      const packageBlobClient = this.azureContainerClient.getBlobClient(packagePath);
-
-      packageBlobClient
-        .getProperties()
-        .then((packageProperties) => {
-          if (!packageProperties.lastModified) return resolve();
-
-          return onPackage(
-            {
-              name: packageName,
-              path: packageName,
-              time: packageProperties.lastModified.getTime(),
-            },
-            resolve,
-          );
-        })
-        .catch((error) => {
-          this.logger.warn({ packageName, error }, `${LOGGER_PREFIX}: Failed getting @{packageName}! @{error}`);
-        });
-    });
+  deleteToken(user: string, tokenKey: string): Promise<void> {
+    return this.database.update((current) => ({
+      ...current,
+      tokens: current.tokens.filter((existing) => !isSameToken(existing, user, tokenKey)),
+    }));
   }
 
-  public saveToken(): Promise<Token> {
-    throw new Error('Method not implemented.');
-  }
-
-  public deleteToken(): Promise<Token> {
-    throw new Error('Method not implemented.');
-  }
-
-  public readTokens(): Promise<Token[]> {
-    throw new Error('Method not implemented.');
-  }
-
-  /**
-   * Gets (or creates if needed) local storage
-   */
-  private async getOrCreateLocalStorage(): Promise<LocalStorage> {
-    if (!this.localStorage) {
-      try {
-        this.localStorage = await this.localStorageProvider.getLocalStorage();
-      } catch (ex) {
-        this.logger.error(
-          { ex },
-          `${LOGGER_PREFIX}: Error in getting local storage from local storage provider! @{ex}`,
-        );
-        throw ex;
-      }
-
-      //New local storage
-      if (!this.localStorage) {
-        this.logger.warn(`${LOGGER_PREFIX}: Local storage doesn't exist. Pre-creating local storage...`);
-        this.localStorage = { list: [], secret: '' };
-      }
-    }
-
-    return this.localStorage;
-  }
-
-  private async writeLocalStorage(): Promise<void> {
-    try {
-      await this.localStorageProvider.saveLocalStorage(this.localStorage!);
-    } catch (ex) {
-      this.logger.error({ ex }, `${LOGGER_PREFIX}: Error in saving local storage from local storage provider! @{ex}`);
-      throw ex;
-    }
+  async readTokens({ user }: TokenFilter): Promise<Token[]> {
+    return (await this.database.read()).tokens.filter((token) => token.user === user);
   }
 }
